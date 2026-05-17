@@ -4,30 +4,57 @@ import json
 import datetime
 import urllib.parse
 import re
+import requests
+from supabase import create_client, Client
+
+# ==========================================
+# SUPABASE CLOUD CONNECTION
+# ==========================================
+SUPABASE_URL = "https://nizpcbcwytiwdaxrftjo.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5penBjYmN3eXRpd2RheHJmdGpvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkwMTc5NjUsImV4cCI6MjA5NDU5Mzk2NX0.VB9dNMaHmI7mf2zQd4cqOdFZ6Tgb6IawPOULv2hJM7Q"
+
+# Initialize the cloud client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ==========================================
 # 1. TOOLS (The Agent's Actions)
 # ==========================================
 
 def save_story_to_library(title, content):
-    """Saves the generated story to a local text file."""
-    filename = f"{title.replace(' ', '_').lower()}.txt"
+    """Saves the generated story to the Cloud (Supabase) and locally."""
     try:
+        # 1. Push to Cloud Database
+        supabase.table("stories").insert({
+            "title": title, 
+            "content": content
+        }).execute()
+        
+        # 2. Save local backup
+        filename = f"{title.replace(' ', '_').lower()}.txt"
         with open(filename, "w") as file:
-            file.write(f"Title: {title}\n")
-            file.write(f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-            file.write("-" * 20 + "\n")
-            file.write(content)
-        return f"Successfully saved as {filename}"
+            file.write(f"Title: {title}\nDate: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n{content}")
+            
+        return f"Successfully saved '{title}' to the Cloud! ☁️"
     except Exception as e:
-        return f"Error saving file: {str(e)}"
-
+        return f"Database Error: {str(e)}"
+    
 def generate_scene_image(image_prompt):
-    """Generates an image URL via Pollinations.ai."""
-    # Cap the prompt to 200 chars to ensure the URL doesn't break
+    """Generates and downloads an image via Pollinations.ai."""
     short_prompt = image_prompt[:200]
     encoded = urllib.parse.quote(short_prompt)
-    return f"https://image.pollinations.ai/prompt/{encoded}?width=800&height=400&nologo=true"
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width=800&height=400&nologo=true"
+    
+    # Create a unique filename based on the current time
+    filename = f"scene_{int(datetime.datetime.now().timestamp())}.jpg"
+    
+    try:
+        # The agent physically downloads the image to your VM
+        response = requests.get(url, timeout=15)
+        with open(filename, "wb") as file:
+            file.write(response.content)
+        return filename # Return the local file path instead of the URL
+    except Exception as e:
+        return url # Fallback to the URL if the download fails
 
 # Define the tool schema for Groq
 tools = [
@@ -88,7 +115,7 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 # ==========================================
-# 3. AGENT EXECUTION LOOP
+# 3. AGENT EXECUTION LOOP (Zero-Crash Manual Parsing)
 # ==========================================
 
 if prompt := st.chat_input("Write a cyberpunk story set in Sepang..."):
@@ -99,63 +126,53 @@ if prompt := st.chat_input("Write a cyberpunk story set in Sepang..."):
     with st.chat_message("assistant"):
         with st.spinner("Processing story and visuals..."):
             try:
+                # We do NOT pass the tools=tools array here anymore. 
+                # This stops Groq from throwing 400 errors when Llama slips up.
                 response = client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
                     messages=[
                         {
                             "role": "system", 
-                            "content": "You are a master storyteller. Always call 'generate_scene_image' to illustrate your stories. Use the JSON tool API. If you use 'save_story_to_library', provide a title and the full story content."
+                            "content": (
+                                "You are a master storyteller. You must provide a story and trigger actions.\n"
+                                "To generate an image, you MUST include this exact string in your response:\n"
+                                "TRIGGER_IMAGE: [Your visual prompt here]\n\n"
+                                "To save the story, you MUST include this exact string at the end:\n"
+                                "TRIGGER_SAVE: [Story Title] | [Full Story Content]\n\n"
+                                "Keep the story text concise (2-3 sentences)."
+                            )
                         },
                         *st.session_state.messages
-                    ],
-                    tools=tools,
-                    tool_choice="auto"
+                    ]
                 )
 
-                response_message = response.choices[0].message
-                tool_calls = response_message.tool_calls
-                final_text = response_message.content or ""
+                final_text = response.choices[0].message.content or ""
 
-                # --- PHASE 1: Handle Official Tool Calls ---
-                if tool_calls:
-                    for tool_call in tool_calls:
-                        f_name = tool_call.function.name
-                        f_args = json.loads(tool_call.function.arguments)
-                        
-                        if f_name == "generate_scene_image":
-                            img_url = generate_scene_image(f_args['image_prompt'])
-                            st.markdown(f"![Scene]({img_url})")
-                            st.session_state.messages.append({"role": "assistant", "content": f"![Scene]({img_url})"})
-                        
-                        if f_name == "save_story_to_library":
-                            result = save_story_to_library(f_args['title'], f_args['content'])
-                            st.toast(result, icon="💾")
+                # --- 1. Intercept Image Trigger ---
+                image_match = re.search(r'TRIGGER_IMAGE:\s*(.*)', final_text)
+                if image_match:
+                    # Extract the prompt up to the next newline or end of string
+                    img_prompt = image_match.group(1).split('\n')[0].strip()
+                    img_url = generate_scene_image(img_prompt)
+                    st.image(img_url, caption="Generated Scene")
+                    st.session_state.messages.append({"role": "assistant", "content": f"📁 Local Image Saved: {img_url}"})
 
-                # --- PHASE 2: Regex Backdoor for Hallucinations ---
-                # This catches cases where Llama types the function call instead of using the API
-                hallucinations = re.finditer(r'function=(\w+)(\{.*?\})', final_text)
-                for match in hallucinations:
-                    f_name, f_json = match.group(1), match.group(2)
-                    try:
-                        args = json.loads(f_json)
-                        if f_name == "generate_scene_image":
-                            url = generate_scene_image(args.get('image_prompt', ''))
-                            st.markdown(f"![Scene]({url})")
-                            st.session_state.messages.append({"role": "assistant", "content": f"![Scene]({url})"})
-                        elif f_name == "save_story_to_library":
-                            res = save_story_to_library(args.get('title', 'Story'), args.get('content', ''))
-                            st.toast(res, icon="💾")
-                    except:
-                        continue
+                # --- 2. Intercept Save Trigger ---
+                save_match = re.search(r'TRIGGER_SAVE:\s*(.*?)\s*\|\s*(.*)', final_text, re.DOTALL)
+                if save_match:
+                    title = save_match.group(1).strip()
+                    content = save_match.group(2).strip()
+                    result = save_story_to_library(title, content)
+                    st.toast(result, icon="💾")
 
-                # --- PHASE 3: Clean & Display Final Text ---
-                # Remove raw function strings from the text display
-                clean_text = re.sub(r'function=\w+\{.*?\}', '', final_text).strip()
-                if clean_text and clean_text != "0":
+                # --- 3. Clean up UI Display Text ---
+                # Remove the ugly trigger codes so the user only sees a clean story
+                clean_text = re.sub(r'TRIGGER_IMAGE:.*', '', final_text)
+                clean_text = re.sub(r'TRIGGER_SAVE:.*', '', clean_text, flags=re.DOTALL).strip()
+                
+                if clean_text:
                     st.markdown(clean_text)
                     st.session_state.messages.append({"role": "assistant", "content": clean_text})
-                elif not tool_calls and not list(re.finditer(r'function=', final_text)):
-                    st.write("Generated your visual story!")
 
             except Exception as e:
-                st.error(f"Error: {str(e)}")
+                st.error(f"Execution Error: {str(e)}")
